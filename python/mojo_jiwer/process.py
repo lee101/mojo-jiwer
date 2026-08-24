@@ -173,8 +173,10 @@ def process_words(
     hits = substitutions = deletions = insertions = 0
     reference_words = hypothesis_words = 0
 
-    for ref, hyp in zip(ref_ids, hyp_ids):
-        sentence_chunks = _chunks(_native.trace(ref, hyp))
+    for ref, hyp, operations in zip(
+        ref_ids, hyp_ids, _native.traces(ref_ids, hyp_ids)
+    ):
+        sentence_chunks = _chunks(operations)
         for chunk in sentence_chunks:
             if chunk.type == "equal":
                 hits += chunk.ref_end_idx - chunk.ref_start_idx

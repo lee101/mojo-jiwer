@@ -82,12 +82,18 @@ def myers_64(
     pattern_len: Int,
     text_len: Int,
     masks: U64Ptr,
+    mask_word_stride: Int,
 ) -> Int:
     for pi in range(pattern_len):
-        masks.unsafe_store(Int(pattern.unsafe_load(pattern_start + pi)), UInt64(0))
+        var token = Int(pattern.unsafe_load(pattern_start + pi))
+        masks.unsafe_store(token * mask_word_stride, UInt64(0))
     for pi in range(pattern_len):
         var token = Int(pattern.unsafe_load(pattern_start + pi))
-        masks.unsafe_store(token, masks.unsafe_load(token) | (UInt64(1) << UInt64(pi)))
+        var offset = token * mask_word_stride
+        masks.unsafe_store(
+            offset,
+            masks.unsafe_load(offset) | (UInt64(1) << UInt64(pi)),
+        )
 
     var positive = ~UInt64(0)
     var negative = UInt64(0)
@@ -95,7 +101,9 @@ def myers_64(
     var last = UInt64(1) << UInt64(pattern_len - 1)
 
     for ti in range(text_len):
-        var equal = masks.unsafe_load(Int(text.unsafe_load(text_start + ti)))
+        var equal = masks.unsafe_load(
+            Int(text.unsafe_load(text_start + ti)) * mask_word_stride
+        )
         var xv = equal | negative
         var xh = (((equal & positive) + positive) ^ positive) | equal
         var ph = negative | ~(xh | positive)
@@ -112,7 +120,100 @@ def myers_64(
         negative = ph & xv
 
     for pi in range(pattern_len):
-        masks.unsafe_store(Int(pattern.unsafe_load(pattern_start + pi)), UInt64(0))
+        masks.unsafe_store(
+            Int(pattern.unsafe_load(pattern_start + pi)) * mask_word_stride,
+            UInt64(0),
+        )
+    return score
+
+
+def fill_words(pointer: U64Ptr, count: Int, value: UInt64):
+    comptime W = simd_width_of[DType.float64]()
+    var values = SIMD[DType.uint64, W](value)
+    var i = 0
+    while i + W <= count:
+        pointer.unsafe_store(i, values)
+        i += W
+    while i < count:
+        pointer.unsafe_store(i, value)
+        i += 1
+
+
+def myers_multiword(
+    pattern: I64Ptr,
+    text: I64Ptr,
+    pattern_start: Int,
+    text_start: Int,
+    pattern_len: Int,
+    text_len: Int,
+    masks: U64Ptr,
+    mask_word_stride: Int,
+    mask_state_offset: Int,
+) -> Int:
+    var words = (pattern_len + 63) // 64
+    for pi in range(pattern_len):
+        var token = Int(pattern.unsafe_load(pattern_start + pi))
+        masks.unsafe_store(
+            token * mask_word_stride + pi // 64,
+            UInt64(0),
+        )
+    for pi in range(pattern_len):
+        var token = Int(pattern.unsafe_load(pattern_start + pi))
+        var offset = token * mask_word_stride + pi // 64
+        masks.unsafe_store(
+            offset,
+            masks.unsafe_load(offset) | (UInt64(1) << UInt64(pi % 64)),
+        )
+
+    var positive = masks.unsafe_offset(mask_state_offset)
+    var negative = positive.unsafe_offset(words)
+    fill_words(positive, words, ~UInt64(0))
+    fill_words(negative, words, UInt64(0))
+
+    var score = pattern_len
+    var final_word = words - 1
+    var high_bit = UInt64(1) << UInt64((pattern_len - 1) % 64)
+    for ti in range(text_len):
+        var add_carry = UInt64(0)
+        var positive_carry = UInt64(1)
+        var negative_carry = UInt64(0)
+        var token_offset = (
+            Int(text.unsafe_load(text_start + ti)) * mask_word_stride
+        )
+        for word in range(words):
+            var pv = positive.unsafe_load(word)
+            var nv = negative.unsafe_load(word)
+            var equal = masks.unsafe_load(token_offset + word)
+            var xv = equal | nv
+            var left = xv & pv
+            var first_sum = left + pv
+            var first_carry = first_sum < left
+            var full_sum = first_sum + add_carry
+            var second_carry = full_sum < first_sum
+            add_carry = UInt64(first_carry or second_carry)
+            var xh = (full_sum ^ pv) | xv
+            var ph = nv | ~(xh | pv)
+            var mh = xh & pv
+            if word == final_word:
+                if ph & high_bit:
+                    score += 1
+                elif mh & high_bit:
+                    score -= 1
+            var next_positive_carry = ph >> 63
+            var next_negative_carry = mh >> 63
+            ph = (ph << 1) | positive_carry
+            mh = (mh << 1) | negative_carry
+            positive_carry = next_positive_carry
+            negative_carry = next_negative_carry
+            positive.unsafe_store(word, mh | ~(xh | ph))
+            negative.unsafe_store(word, ph & xh)
+
+    for pi in range(pattern_len):
+        masks.unsafe_store(
+            Int(pattern.unsafe_load(pattern_start + pi)) * mask_word_stride
+            + pi // 64,
+            UInt64(0),
+        )
     return score
 
 
@@ -121,8 +222,9 @@ def distance_impl(
     hypothesis: I64Ptr,
     reference_len: Int,
     hypothesis_len: Int,
-    rows: I32Ptr,
     masks: U64Ptr,
+    mask_word_stride: Int,
+    mask_state_offset: Int,
 ) -> Int:
     var shared_prefix = matching_prefix(
         reference, hypothesis, min(reference_len, hypothesis_len)
@@ -150,35 +252,39 @@ def distance_impl(
         return n
 
     if m <= 63:
-        return myers_64(hypothesis, reference, hyp_start, ref_start, m, n, masks)
+        return myers_64(
+            hypothesis,
+            reference,
+            hyp_start,
+            ref_start,
+            m,
+            n,
+            masks,
+            mask_word_stride,
+        )
     if n <= 63:
-        return myers_64(reference, hypothesis, ref_start, hyp_start, n, m, masks)
+        return myers_64(
+            reference,
+            hypothesis,
+            ref_start,
+            hyp_start,
+            n,
+            m,
+            masks,
+            mask_word_stride,
+        )
 
-    var width = m + 1
-    comptime W = simd_width_of[DType.float64]()
-    var j = 0
-    while j + W <= width:
-        rows.unsafe_store(j, iota[DType.int32, W](Int32(j)))
-        j += W
-    while j < width:
-        rows.unsafe_store(j, Int32(j))
-        j += 1
-
-    for i in range(1, n + 1):
-        var previous_offset = ((i - 1) & 1) * width
-        var current_offset = (i & 1) * width
-        rows.unsafe_store(current_offset, Int32(i))
-        var ref_token = reference.unsafe_load(ref_start + i - 1)
-        for j in range(1, m + 1):
-            var diagonal = rows.unsafe_load(previous_offset + j - 1)
-            var deletion = rows.unsafe_load(previous_offset + j) + 1
-            var insertion = rows.unsafe_load(current_offset + j - 1) + 1
-            var substitution = diagonal
-            if ref_token != hypothesis.unsafe_load(hyp_start + j - 1):
-                substitution += 1
-            rows.unsafe_store(current_offset + j, min(substitution, min(deletion, insertion)))
-
-    return Int(rows.unsafe_load((n & 1) * width + m))
+    return myers_multiword(
+        hypothesis,
+        reference,
+        hyp_start,
+        ref_start,
+        m,
+        n,
+        masks,
+        mask_word_stride,
+        mask_state_offset,
+    )
 
 
 @export("mji_distance")
@@ -187,16 +293,18 @@ def mji_distance(
     hypothesis_addr: Int,
     reference_len: Int,
     hypothesis_len: Int,
-    rows_addr: Int,
     masks_addr: Int,
+    mask_word_stride: Int,
+    mask_state_offset: Int,
 ) abi("C") -> Int:
     return distance_impl(
         i64_ptr(reference_addr),
         i64_ptr(hypothesis_addr),
         reference_len,
         hypothesis_len,
-        i32_ptr(rows_addr),
         u64_ptr(masks_addr),
+        mask_word_stride,
+        mask_state_offset,
     )
 
 
@@ -205,10 +313,10 @@ def compute_distance_at(
     hypotheses: I64Ptr,
     reference_offsets: I64Ptr,
     hypothesis_offsets: I64Ptr,
-    rows: I32Ptr,
-    row_stride: Int,
     masks: U64Ptr,
     mask_stride: Int,
+    mask_word_stride: Int,
+    mask_state_offset: Int,
     distances: I64Ptr,
     index: Int,
     scratch_index: Int,
@@ -225,8 +333,9 @@ def compute_distance_at(
                 hypotheses.unsafe_offset(hyp_start),
                 ref_len,
                 hyp_len,
-                rows.unsafe_offset(scratch_index * row_stride),
                 masks.unsafe_offset(scratch_index * mask_stride),
+                mask_word_stride,
+                mask_state_offset,
             )
         ),
     )
@@ -239,10 +348,10 @@ async def compute_distance_chunk(
     hypothesis_offsets: I64Ptr,
     count: Int,
     worker_count: Int,
-    rows: I32Ptr,
-    row_stride: Int,
     masks: U64Ptr,
     mask_stride: Int,
+    mask_word_stride: Int,
+    mask_state_offset: Int,
     distances: I64Ptr,
     chunk: Int,
 ):
@@ -254,10 +363,10 @@ async def compute_distance_chunk(
             hypotheses,
             reference_offsets,
             hypothesis_offsets,
-            rows,
-            row_stride,
             masks,
             mask_stride,
+            mask_word_stride,
+            mask_state_offset,
             distances,
             index,
             chunk,
@@ -272,17 +381,16 @@ def mji_distances(
     hypothesis_offsets_addr: Int,
     count: Int,
     worker_count: Int,
-    rows_addr: Int,
-    row_stride: Int,
     masks_addr: Int,
     mask_stride: Int,
+    mask_word_stride: Int,
+    mask_state_offset: Int,
     distances_addr: Int,
 ) abi("C"):
     var references = i64_ptr(references_addr)
     var hypotheses = i64_ptr(hypotheses_addr)
     var reference_offsets = i64_ptr(reference_offsets_addr)
     var hypothesis_offsets = i64_ptr(hypothesis_offsets_addr)
-    var rows = i32_ptr(rows_addr)
     var masks = u64_ptr(masks_addr)
     var distances = i64_ptr(distances_addr)
 
@@ -298,10 +406,10 @@ def mji_distances(
                     hypothesis_offsets,
                     count,
                     worker_count,
-                    rows,
-                    row_stride,
                     masks,
                     mask_stride,
+                    mask_word_stride,
+                    mask_state_offset,
                     distances,
                     chunk,
                 )
@@ -314,10 +422,10 @@ def mji_distances(
                 hypotheses,
                 reference_offsets,
                 hypothesis_offsets,
-                rows,
-                row_stride,
                 masks,
                 mask_stride,
+                mask_word_stride,
+                mask_state_offset,
                 distances,
                 index,
                 0,
@@ -416,6 +524,133 @@ def trace_impl(
     count += prefix
 
     return count
+
+
+def compute_trace_at(
+    references: I64Ptr,
+    hypotheses: I64Ptr,
+    reference_offsets: I64Ptr,
+    hypothesis_offsets: I64Ptr,
+    matrices: I32Ptr,
+    matrix_stride: Int,
+    operation_offsets: I64Ptr,
+    operations: U8Ptr,
+    operation_counts: I64Ptr,
+    index: Int,
+    scratch_index: Int,
+):
+    var ref_start = Int(reference_offsets.unsafe_load(index))
+    var hyp_start = Int(hypothesis_offsets.unsafe_load(index))
+    var ref_len = Int(reference_offsets.unsafe_load(index + 1)) - ref_start
+    var hyp_len = Int(hypothesis_offsets.unsafe_load(index + 1)) - hyp_start
+    operation_counts.unsafe_store(
+        index,
+        Int64(
+            trace_impl(
+                references.unsafe_offset(ref_start),
+                hypotheses.unsafe_offset(hyp_start),
+                ref_len,
+                hyp_len,
+                matrices.unsafe_offset(scratch_index * matrix_stride),
+                operations.unsafe_offset(
+                    Int(operation_offsets.unsafe_load(index))
+                ),
+            )
+        ),
+    )
+
+
+async def compute_trace_chunk(
+    references: I64Ptr,
+    hypotheses: I64Ptr,
+    reference_offsets: I64Ptr,
+    hypothesis_offsets: I64Ptr,
+    count: Int,
+    worker_count: Int,
+    matrices: I32Ptr,
+    matrix_stride: Int,
+    operation_offsets: I64Ptr,
+    operations: U8Ptr,
+    operation_counts: I64Ptr,
+    chunk: Int,
+):
+    var start = count * chunk // worker_count
+    var end = count * (chunk + 1) // worker_count
+    for index in range(start, end):
+        compute_trace_at(
+            references,
+            hypotheses,
+            reference_offsets,
+            hypothesis_offsets,
+            matrices,
+            matrix_stride,
+            operation_offsets,
+            operations,
+            operation_counts,
+            index,
+            chunk,
+        )
+
+
+@export("mji_traces")
+def mji_traces(
+    references_addr: Int,
+    hypotheses_addr: Int,
+    reference_offsets_addr: Int,
+    hypothesis_offsets_addr: Int,
+    count: Int,
+    worker_count: Int,
+    matrices_addr: Int,
+    matrix_stride: Int,
+    operation_offsets_addr: Int,
+    operations_addr: Int,
+    operation_counts_addr: Int,
+) abi("C"):
+    var references = i64_ptr(references_addr)
+    var hypotheses = i64_ptr(hypotheses_addr)
+    var reference_offsets = i64_ptr(reference_offsets_addr)
+    var hypothesis_offsets = i64_ptr(hypothesis_offsets_addr)
+    var matrices = i32_ptr(matrices_addr)
+    var operation_offsets = i64_ptr(operation_offsets_addr)
+    var operations = u8_ptr(operations_addr)
+    var operation_counts = i64_ptr(operation_counts_addr)
+
+    if worker_count > 1:
+        initialize_runtime()
+        var tasks = TaskGroup()
+        for chunk in range(worker_count):
+            tasks.create_task(
+                compute_trace_chunk(
+                    references,
+                    hypotheses,
+                    reference_offsets,
+                    hypothesis_offsets,
+                    count,
+                    worker_count,
+                    matrices,
+                    matrix_stride,
+                    operation_offsets,
+                    operations,
+                    operation_counts,
+                    chunk,
+                )
+            )
+        tasks.wait()
+    else:
+        for index in range(count):
+            compute_trace_at(
+                references,
+                hypotheses,
+                reference_offsets,
+                hypothesis_offsets,
+                matrices,
+                matrix_stride,
+                operation_offsets,
+                operations,
+                operation_counts,
+                index,
+                0,
+            )
 
 
 @export("mji_trace")

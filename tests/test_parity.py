@@ -6,6 +6,7 @@ from dataclasses import asdict
 
 import numpy as np
 import pytest
+from rapidfuzz.distance import Levenshtein
 
 upstream = pytest.importorskip("jiwer")
 
@@ -110,6 +111,19 @@ def test_long_distance_uses_multiword_fallback():
     )
 
 
+@pytest.mark.parametrize("length", [64, 65, 127, 257, 1_000])
+def test_multiword_distance_boundaries_and_simd_tail(length):
+    reference = [index % 29 for index in range(length)]
+    hypothesis = reference.copy()
+    for index in range(3, length, 37):
+        hypothesis[index] = 100 + index % 11
+    hypothesis.insert(length // 3, 500)
+    del hypothesis[(2 * length) // 3]
+    assert _native.distance(reference, hypothesis) == Levenshtein.distance(
+        reference, hypothesis
+    )
+
+
 def test_simd_prefix_and_suffix_tails_match_upstream():
     reference_tokens = list(range(30))
     hypothesis_tokens = reference_tokens.copy()
@@ -133,6 +147,17 @@ def test_distance_parallel_threshold_parity(count):
     references = [reference] * count
     hypotheses = [hypothesis] * count
     assert _native.distances(references, hypotheses) == [1] * count
+
+
+@pytest.mark.parametrize("count", [255, 256])
+def test_trace_parallel_threshold_parity(count):
+    reference = list(range(30))
+    hypothesis = reference.copy()
+    hypothesis[13:16] = [100, 101]
+    expected = _native.trace(reference, hypothesis)
+    assert _native.traces([reference] * count, [hypothesis] * count) == [
+        expected
+    ] * count
 
 
 def test_custom_transform_parity():

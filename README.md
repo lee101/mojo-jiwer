@@ -87,7 +87,7 @@ score = jiwer.wer(
 
 ## Benchmarks
 
-Measured on 2026-07-30 on an Intel Xeon E5-2697 v4 at 2.30 GHz, Linux x86-64.
+Measured on 2026-08-24 on an Intel Xeon E5-2697 v4 at 2.30 GHz, Linux x86-64.
 These are end-to-end Python API timings, including transformations, token
 encoding, NumPy buffer preparation, FFI, and the native computation. The ratio
 is upstream jiwer time divided by mojo-jiwer time; values below 1 mean
@@ -95,15 +95,19 @@ mojo-jiwer is slower.
 
 | Case | mojo-jiwer | jiwer | jiwer / Mojo | Result |
 |---|---:|---:|---:|---|
-| WER: 10,000 x 12-word utterances | 2.81 ms | 1.16 ms | 0.41x | slower |
-| WER: 2,000 x 60-word utterances | 2.76 ms | 1.13 ms | 0.41x | slower |
-| CER: 5,000 x 48-character utterances | 102.88 ms | 6.94 ms | 0.07x | slower |
-| process_words: 2,000 x 20 words | 3.00 ms | 1.03 ms | 0.34x | slower |
-| WER: one 1,000-word transcript | 2.78 ms | 1.04 ms | 0.37x | slower |
+| WER: 10,000 x 12-word utterances | 103.09 ms | 191.55 ms | 1.86x | faster |
+| WER: 2,000 x 60-word utterances | 80.18 ms | 138.49 ms | 1.73x | faster |
+| CER: 5,000 x 48-character utterances | 6.35 ms | 155.42 ms | 24.48x | faster |
+| process_words: 2,000 x 20 words | 42.46 ms | 48.58 ms | 1.14x | faster |
+| WER: one 1,000-word transcript | 0.77 ms | 1.05 ms | 1.36x | faster |
 
-These are deliberately reported as measured: mature jiwer delegates to the
-highly optimized RapidFuzz C++ implementation and is faster in every tested
-case. Reproduce the table with:
+These are deliberately reported as measured. The benchmark now binds each
+case's inputs in its callable; an earlier table accidentally late-bound all
+five labels to the final 1,000-word input. Against the corrected pre-optimization
+baseline, Mojo improved from 134.73 to 103.09 ms, 113.69 to 80.18 ms, 99.93 to
+42.46 ms, and 2.67 to 0.77 ms in the four WER/processing cases. CER moved from
+4.75 to 6.35 ms and remains far ahead of upstream; it was not an optimization
+target. Reproduce the table with:
 
 ```bash
 pixi run bench
@@ -120,22 +124,24 @@ codepoints directly into 64-bit NumPy buffers. For scalar WER/CER over multiple
 utterances, the wrapper flattens the tokens with 64-bit sentence offsets and
 makes one batched `ctypes` call.
 
-The Mojo kernel trims common affixes, uses a 64-bit Myers edit-distance kernel
-for short sequences, and falls back to two-row Wagner-Fischer dynamic
-programming for longer sequences. Full processing uses a row-major 32-bit cost
-matrix and an 8-bit operation buffer to recover exactly the alignment choices
-used by upstream jiwer's RapidFuzz backend.
+The Mojo kernel trims common affixes and uses Myers edit distance: a specialized
+64-bit kernel for short sequences and an exact multiword bit-parallel kernel for
+longer sequences. Full processing uses a row-major 32-bit cost matrix and an
+8-bit operation buffer to recover exactly the alignment choices used by
+upstream jiwer's RapidFuzz backend.
 
-Common-affix scans and dynamic-programming row initialization use host-width
-SIMD with scalar remainder loops. Distance batches stay serial unless they
-contain at least 256 pairs and 200,000 input tokens; larger batches use up to
-16 coarse CPU workers with independent scratch buffers.
+Common-affix scans, matrix boundaries, and multiword state initialization use
+host-width SIMD with scalar remainder loops. Distance batches stay serial
+unless they contain at least 256 pairs and 200,000 input tokens. Traceback is
+batched across one FFI call and stays serial unless it contains at least 256
+pairs and 200,000 dynamic-programming cells. Larger batches use up to 16 coarse
+CPU workers with independent, memory-capped scratch buffers.
 
-There is intentionally no GPU path. Myers performs roughly a dozen integer
-operations per 16 bytes loaded, while each dynamic-programming cell moves at
-least 16 bytes for only a handful of integer operations. Both are well below
-the roughly 2 operations-per-byte threshold where device transfer and launch
-cost can pay off, so a GPU path would lose on these workloads.
+There is intentionally no GPU path. Multiword Myers performs roughly 20 integer
+operations while loading or updating about 24 bytes per word, and each traceback
+cell moves at least 16 bytes for only a handful of integer operations. Both are
+well below the roughly 2 operations-per-byte threshold where device transfer
+and launch cost can pay off, so a GPU path would lose on these workloads.
 
 All FFI buffers are C-contiguous NumPy allocations owned by Python. They cross
 the C ABI as integer addresses and are rebuilt as

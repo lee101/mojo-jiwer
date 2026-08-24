@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import subprocess
+from itertools import chain
 
 import numpy as np
 
@@ -16,9 +17,10 @@ LIBRARY = os.environ.get("MOJO_JIWER_LIB") or os.path.join(
 I64 = ctypes.c_int64
 
 _SIGNATURES = {
-    "mji_distance": ([I64] * 6, I64),
+    "mji_distance": ([I64] * 7, I64),
     "mji_distances": ([I64] * 11, None),
     "mji_trace": ([I64, I64, I64, I64, I64, I64], I64),
+    "mji_traces": ([I64] * 11, None),
 }
 
 _library: ctypes.CDLL | None = None
@@ -95,18 +97,52 @@ def distance(reference: list[int], hypothesis: list[int]) -> int:
     if len(hypothesis) > len(reference):
         ref, hyp = hyp, ref
         reference, hypothesis = hypothesis, reference
-    rows = np.empty(2 * (len(hypothesis) + 1), dtype=np.int32)
-    masks = np.zeros(max(int(ref.max()), int(hyp.max())) + 1, dtype=np.uint64)
+    mask_word_stride = max(1, (len(hypothesis) + 63) // 64)
+    mask_state_offset = (
+        max(int(ref.max()), int(hyp.max())) + 1
+    ) * mask_word_stride
+    masks = np.zeros(mask_state_offset + 2 * mask_word_stride, dtype=np.uint64)
     return int(
         library().mji_distance(
             _address(ref),
             _address(hyp),
             len(reference),
             len(hypothesis),
-            _address(rows),
             _address(masks),
+            mask_word_stride,
+            mask_state_offset,
         )
     )
+
+
+def _flatten_sequences(
+    references: list[list[int]], hypotheses: list[list[int]]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    count = len(references)
+    ref_offsets = np.empty(count + 1, dtype=np.int64)
+    hyp_offsets = np.empty(count + 1, dtype=np.int64)
+    ref_offsets[0] = hyp_offsets[0] = 0
+    np.cumsum(
+        np.fromiter(map(len, references), dtype=np.int64, count=count),
+        out=ref_offsets[1:],
+    )
+    np.cumsum(
+        np.fromiter(map(len, hypotheses), dtype=np.int64, count=count),
+        out=hyp_offsets[1:],
+    )
+    ref_count = int(ref_offsets[-1])
+    hyp_count = int(hyp_offsets[-1])
+    ref = np.fromiter(
+        chain.from_iterable(references), dtype=np.int64, count=ref_count
+    )
+    hyp = np.fromiter(
+        chain.from_iterable(hypotheses), dtype=np.int64, count=hyp_count
+    )
+    if not ref_count:
+        ref = np.zeros(1, dtype=np.int64)
+    if not hyp_count:
+        hyp = np.zeros(1, dtype=np.int64)
+    return ref, hyp, ref_offsets, hyp_offsets
 
 
 def distances(
@@ -122,27 +158,9 @@ def distances(
         else (hypothesis, reference)
         for reference, hypothesis in zip(references, hypotheses)
     ]
-    ref_offsets = np.empty(len(pairs) + 1, dtype=np.int64)
-    hyp_offsets = np.empty(len(pairs) + 1, dtype=np.int64)
-    ref_offsets[0] = hyp_offsets[0] = 0
-    np.cumsum(
-        np.fromiter(
-            (len(reference) for reference, _ in pairs),
-            dtype=np.int64,
-            count=len(pairs),
-        ),
-        out=ref_offsets[1:],
+    ref, hyp, ref_offsets, hyp_offsets = _flatten_sequences(
+        [pair[0] for pair in pairs], [pair[1] for pair in pairs]
     )
-    np.cumsum(
-        np.fromiter(
-            (len(hypothesis) for _, hypothesis in pairs),
-            dtype=np.int64,
-            count=len(pairs),
-        ),
-        out=hyp_offsets[1:],
-    )
-    ref = token_array([token for pair in pairs for token in pair[0]])
-    hyp = token_array([token for pair in pairs for token in pair[1]])
     return distances_flat(ref, hyp, ref_offsets, hyp_offsets)
 
 
@@ -182,12 +200,14 @@ def distances_flat(
         hyp = np.zeros(1, dtype=np.int64)
     ref_lengths = np.diff(ref_offsets)
     hyp_lengths = np.diff(hyp_offsets)
-    row_stride = 2 * (int(hyp_lengths.max(initial=0)) + 1)
-    mask_stride = max(int(ref.max()), int(hyp.max())) + 1
+    mask_word_stride = max(1, (int(hyp_lengths.max(initial=0)) + 63) // 64)
+    mask_state_offset = (
+        max(int(ref.max()), int(hyp.max())) + 1
+    ) * mask_word_stride
+    mask_stride = mask_state_offset + 2 * mask_word_stride
     token_work = int(np.maximum(ref_lengths, hyp_lengths).sum())
     worker_count = min(16, count) if count >= 256 and token_work >= 200_000 else 1
     scratch_count = worker_count
-    rows = np.empty(row_stride * scratch_count, dtype=np.int32)
     masks = np.zeros(mask_stride * scratch_count, dtype=np.uint64)
     result = np.empty(count, dtype=np.int64)
     library().mji_distances(
@@ -197,10 +217,10 @@ def distances_flat(
         _address(hyp_offsets),
         count,
         worker_count,
-        _address(rows),
-        row_stride if scratch_count > 1 else 0,
         _address(masks),
         mask_stride if scratch_count > 1 else 0,
+        mask_word_stride,
+        mask_state_offset,
         _address(result),
     )
     return result.tolist()
@@ -224,3 +244,51 @@ def trace(reference: list[int], hypothesis: list[int]) -> list[int]:
         )
     )
     return operations[:count][::-1].tolist()
+
+
+def traces(
+    references: list[list[int]], hypotheses: list[list[int]]
+) -> list[list[int]]:
+    if len(references) != len(hypotheses):
+        raise ValueError("references and hypotheses must contain the same number of items")
+    count = len(references)
+    if not count:
+        return []
+    ref, hyp, ref_offsets, hyp_offsets = _flatten_sequences(references, hypotheses)
+    ref_lengths = np.diff(ref_offsets)
+    hyp_lengths = np.diff(hyp_offsets)
+    max_ref = int(ref_lengths.max(initial=0))
+    max_hyp = int(hyp_lengths.max(initial=0))
+    matrix_stride = (max_ref + 1) * (max_hyp + 1)
+    cell_work = int(((ref_lengths + 1) * (hyp_lengths + 1)).sum())
+    worker_count = min(16, count) if count >= 256 and cell_work >= 200_000 else 1
+    worker_count = min(
+        worker_count,
+        max(1, (256 * 1024 * 1024) // (matrix_stride * np.dtype(np.int32).itemsize)),
+    )
+    matrices = np.empty(matrix_stride * worker_count, dtype=np.int32)
+    operation_offsets = np.empty(count + 1, dtype=np.int64)
+    operation_offsets[0] = 0
+    np.cumsum(ref_lengths + hyp_lengths, out=operation_offsets[1:])
+    operations = np.empty(max(1, int(operation_offsets[-1])), dtype=np.uint8)
+    operation_counts = np.empty(count, dtype=np.int64)
+    library().mji_traces(
+        _address(ref),
+        _address(hyp),
+        _address(ref_offsets),
+        _address(hyp_offsets),
+        count,
+        worker_count,
+        _address(matrices),
+        matrix_stride if worker_count > 1 else 0,
+        _address(operation_offsets),
+        _address(operations),
+        _address(operation_counts),
+    )
+    return [
+        operations[
+            int(operation_offsets[index]) : int(operation_offsets[index])
+            + int(operation_counts[index])
+        ][::-1].tolist()
+        for index in range(count)
+    ]

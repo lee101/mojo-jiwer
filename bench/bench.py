@@ -75,27 +75,47 @@ def main() -> None:
 
     reference, hypothesis = word_corpus(10_000, 12, 1)
     cases.append(
-        ("WER: 10,000 x 12-word utterances", lambda: mojo.wer(reference, hypothesis), lambda: upstream.wer(reference, hypothesis))
+        (
+            "WER: 10,000 x 12-word utterances",
+            lambda reference=reference, hypothesis=hypothesis: mojo.wer(reference, hypothesis),
+            lambda reference=reference, hypothesis=hypothesis: upstream.wer(reference, hypothesis),
+        )
     )
 
     reference, hypothesis = word_corpus(2_000, 60, 2)
     cases.append(
-        ("WER: 2,000 x 60-word utterances", lambda: mojo.wer(reference, hypothesis), lambda: upstream.wer(reference, hypothesis))
+        (
+            "WER: 2,000 x 60-word utterances",
+            lambda reference=reference, hypothesis=hypothesis: mojo.wer(reference, hypothesis),
+            lambda reference=reference, hypothesis=hypothesis: upstream.wer(reference, hypothesis),
+        )
     )
 
     reference, hypothesis = character_corpus(5_000, 48, 3)
     cases.append(
-        ("CER: 5,000 x 48-character utterances", lambda: mojo.cer(reference, hypothesis), lambda: upstream.cer(reference, hypothesis))
+        (
+            "CER: 5,000 x 48-character utterances",
+            lambda reference=reference, hypothesis=hypothesis: mojo.cer(reference, hypothesis),
+            lambda reference=reference, hypothesis=hypothesis: upstream.cer(reference, hypothesis),
+        )
     )
 
     reference, hypothesis = word_corpus(2_000, 20, 4)
     cases.append(
-        ("process_words: 2,000 x 20 words", lambda: mojo.process_words(reference, hypothesis), lambda: upstream.process_words(reference, hypothesis))
+        (
+            "process_words: 2,000 x 20 words",
+            lambda reference=reference, hypothesis=hypothesis: mojo.process_words(reference, hypothesis),
+            lambda reference=reference, hypothesis=hypothesis: upstream.process_words(reference, hypothesis),
+        )
     )
 
     reference, hypothesis = word_corpus(1, 1_000, 5)
     cases.append(
-        ("WER: one 1,000-word transcript", lambda: mojo.wer(reference, hypothesis), lambda: upstream.wer(reference, hypothesis))
+        (
+            "WER: one 1,000-word transcript",
+            lambda reference=reference, hypothesis=hypothesis: mojo.wer(reference, hypothesis),
+            lambda reference=reference, hypothesis=hypothesis: upstream.wer(reference, hypothesis),
+        )
     )
 
     print(f"Machine: {cpu_name()}; {platform.system()} {platform.machine()}")
