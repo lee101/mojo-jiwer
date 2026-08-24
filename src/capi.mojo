@@ -1,13 +1,14 @@
 """Levenshtein kernels exposed through a stable C ABI."""
 
-from std.algorithm import parallelize
 from std.math import iota
+from std.runtime import initialize_runtime
+from std.runtime.asyncrt import TaskGroup
 from std.sys.info import simd_width_of
 
-comptime I64Ptr = UnsafePointer[Int64, AnyOrigin[mut=True]]
-comptime I32Ptr = UnsafePointer[Int32, AnyOrigin[mut=True]]
-comptime U64Ptr = UnsafePointer[UInt64, AnyOrigin[mut=True]]
-comptime U8Ptr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
+comptime I64Ptr = Pointer[Int64, AnyOrigin[mut=True]]
+comptime I32Ptr = Pointer[Int32, AnyOrigin[mut=True]]
+comptime U64Ptr = Pointer[UInt64, AnyOrigin[mut=True]]
+comptime U8Ptr = Pointer[UInt8, AnyOrigin[mut=True]]
 
 
 def i64_ptr(addr: Int) -> I64Ptr:
@@ -31,7 +32,7 @@ def matching_prefix(left: I64Ptr, right: I64Ptr, limit: Int) -> Int:
     var index = 0
     while index + W <= limit:
         var matches = (
-            left.load[width=W](index).eq(right.load[width=W](index))
+            left.unsafe_load[width=W](index).eq(right.unsafe_load[width=W](index))
         ).select(
             SIMD[DType.int64, W](1),
             SIMD[DType.int64, W](0),
@@ -39,7 +40,7 @@ def matching_prefix(left: I64Ptr, right: I64Ptr, limit: Int) -> Int:
         if Int(matches.reduce_add()) != W:
             break
         index += W
-    while index < limit and left.load(index) == right.load(index):
+    while index < limit and left.unsafe_load(index) == right.unsafe_load(index):
         index += 1
     return index
 
@@ -57,8 +58,8 @@ def matching_suffix(
         var left_start = left_len - count - W
         var right_start = right_len - count - W
         var matches = (
-            left.load[width=W](left_start).eq(
-                right.load[width=W](right_start)
+            left.unsafe_load[width=W](left_start).eq(
+                right.unsafe_load[width=W](right_start)
             )
         )
         if not Bool(matches.reduce_and()):
@@ -66,8 +67,8 @@ def matching_suffix(
         count += W
     while (
         count < limit
-        and left.load(left_len - count - 1)
-        == right.load(right_len - count - 1)
+        and left.unsafe_load(left_len - count - 1)
+        == right.unsafe_load(right_len - count - 1)
     ):
         count += 1
     return count
@@ -83,10 +84,10 @@ def myers_64(
     masks: U64Ptr,
 ) -> Int:
     for pi in range(pattern_len):
-        masks.store(Int(pattern.load(pattern_start + pi)), UInt64(0))
+        masks.unsafe_store(Int(pattern.unsafe_load(pattern_start + pi)), UInt64(0))
     for pi in range(pattern_len):
-        var token = Int(pattern.load(pattern_start + pi))
-        masks.store(token, masks.load(token) | (UInt64(1) << UInt64(pi)))
+        var token = Int(pattern.unsafe_load(pattern_start + pi))
+        masks.unsafe_store(token, masks.unsafe_load(token) | (UInt64(1) << UInt64(pi)))
 
     var positive = ~UInt64(0)
     var negative = UInt64(0)
@@ -94,7 +95,7 @@ def myers_64(
     var last = UInt64(1) << UInt64(pattern_len - 1)
 
     for ti in range(text_len):
-        var equal = masks.load(Int(text.load(text_start + ti)))
+        var equal = masks.unsafe_load(Int(text.unsafe_load(text_start + ti)))
         var xv = equal | negative
         var xh = (((equal & positive) + positive) ^ positive) | equal
         var ph = negative | ~(xh | positive)
@@ -111,7 +112,7 @@ def myers_64(
         negative = ph & xv
 
     for pi in range(pattern_len):
-        masks.store(Int(pattern.load(pattern_start + pi)), UInt64(0))
+        masks.unsafe_store(Int(pattern.unsafe_load(pattern_start + pi)), UInt64(0))
     return score
 
 
@@ -134,8 +135,8 @@ def distance_impl(
     n -= shared_prefix
     m -= shared_prefix
     var shared_suffix = matching_suffix(
-        reference + ref_start,
-        hypothesis + hyp_start,
+        reference.unsafe_offset(ref_start),
+        hypothesis.unsafe_offset(hyp_start),
         n,
         m,
         min(n, m),
@@ -157,27 +158,27 @@ def distance_impl(
     comptime W = simd_width_of[DType.float64]()
     var j = 0
     while j + W <= width:
-        rows.store(j, iota[DType.int32, W](Int32(j)))
+        rows.unsafe_store(j, iota[DType.int32, W](Int32(j)))
         j += W
     while j < width:
-        rows.store(j, Int32(j))
+        rows.unsafe_store(j, Int32(j))
         j += 1
 
     for i in range(1, n + 1):
         var previous_offset = ((i - 1) & 1) * width
         var current_offset = (i & 1) * width
-        rows.store(current_offset, Int32(i))
-        var ref_token = reference.load(ref_start + i - 1)
+        rows.unsafe_store(current_offset, Int32(i))
+        var ref_token = reference.unsafe_load(ref_start + i - 1)
         for j in range(1, m + 1):
-            var diagonal = rows.load(previous_offset + j - 1)
-            var deletion = rows.load(previous_offset + j) + 1
-            var insertion = rows.load(current_offset + j - 1) + 1
+            var diagonal = rows.unsafe_load(previous_offset + j - 1)
+            var deletion = rows.unsafe_load(previous_offset + j) + 1
+            var insertion = rows.unsafe_load(current_offset + j - 1) + 1
             var substitution = diagonal
-            if ref_token != hypothesis.load(hyp_start + j - 1):
+            if ref_token != hypothesis.unsafe_load(hyp_start + j - 1):
                 substitution += 1
-            rows.store(current_offset + j, min(substitution, min(deletion, insertion)))
+            rows.unsafe_store(current_offset + j, min(substitution, min(deletion, insertion)))
 
-    return Int(rows.load((n & 1) * width + m))
+    return Int(rows.unsafe_load((n & 1) * width + m))
 
 
 @export("mji_distance")
@@ -197,6 +198,70 @@ def mji_distance(
         i32_ptr(rows_addr),
         u64_ptr(masks_addr),
     )
+
+
+def compute_distance_at(
+    references: I64Ptr,
+    hypotheses: I64Ptr,
+    reference_offsets: I64Ptr,
+    hypothesis_offsets: I64Ptr,
+    rows: I32Ptr,
+    row_stride: Int,
+    masks: U64Ptr,
+    mask_stride: Int,
+    distances: I64Ptr,
+    index: Int,
+    scratch_index: Int,
+):
+    var ref_start = Int(reference_offsets.unsafe_load(index))
+    var hyp_start = Int(hypothesis_offsets.unsafe_load(index))
+    var ref_len = Int(reference_offsets.unsafe_load(index + 1)) - ref_start
+    var hyp_len = Int(hypothesis_offsets.unsafe_load(index + 1)) - hyp_start
+    distances.unsafe_store(
+        index,
+        Int64(
+            distance_impl(
+                references.unsafe_offset(ref_start),
+                hypotheses.unsafe_offset(hyp_start),
+                ref_len,
+                hyp_len,
+                rows.unsafe_offset(scratch_index * row_stride),
+                masks.unsafe_offset(scratch_index * mask_stride),
+            )
+        ),
+    )
+
+
+async def compute_distance_chunk(
+    references: I64Ptr,
+    hypotheses: I64Ptr,
+    reference_offsets: I64Ptr,
+    hypothesis_offsets: I64Ptr,
+    count: Int,
+    worker_count: Int,
+    rows: I32Ptr,
+    row_stride: Int,
+    masks: U64Ptr,
+    mask_stride: Int,
+    distances: I64Ptr,
+    chunk: Int,
+):
+    var start = count * chunk // worker_count
+    var end = count * (chunk + 1) // worker_count
+    for index in range(start, end):
+        compute_distance_at(
+            references,
+            hypotheses,
+            reference_offsets,
+            hypothesis_offsets,
+            rows,
+            row_stride,
+            masks,
+            mask_stride,
+            distances,
+            index,
+            chunk,
+        )
 
 
 @export("mji_distances")
@@ -220,38 +285,43 @@ def mji_distances(
     var rows = i32_ptr(rows_addr)
     var masks = u64_ptr(masks_addr)
     var distances = i64_ptr(distances_addr)
-    @parameter
-    def compute(index: Int, scratch_index: Int):
-        var ref_start = Int(reference_offsets.load(index))
-        var hyp_start = Int(hypothesis_offsets.load(index))
-        var ref_len = Int(reference_offsets.load(index + 1)) - ref_start
-        var hyp_len = Int(hypothesis_offsets.load(index + 1)) - hyp_start
-        distances.store(
-            index,
-            Int64(
-                distance_impl(
-                    references + ref_start,
-                    hypotheses + hyp_start,
-                    ref_len,
-                    hyp_len,
-                    rows + scratch_index * row_stride,
-                    masks + scratch_index * mask_stride,
-                )
-            ),
-        )
-
-    @parameter
-    def compute_chunk(chunk: Int):
-        var start = count * chunk // worker_count
-        var end = count * (chunk + 1) // worker_count
-        for index in range(start, end):
-            compute(index, chunk)
 
     if worker_count > 1:
-        parallelize[compute_chunk](worker_count, worker_count)
+        initialize_runtime()
+        var tasks = TaskGroup()
+        for chunk in range(worker_count):
+            tasks.create_task(
+                compute_distance_chunk(
+                    references,
+                    hypotheses,
+                    reference_offsets,
+                    hypothesis_offsets,
+                    count,
+                    worker_count,
+                    rows,
+                    row_stride,
+                    masks,
+                    mask_stride,
+                    distances,
+                    chunk,
+                )
+            )
+        tasks.wait()
     else:
         for index in range(count):
-            compute(index, 0)
+            compute_distance_at(
+                references,
+                hypotheses,
+                reference_offsets,
+                hypothesis_offsets,
+                rows,
+                row_stride,
+                masks,
+                mask_stride,
+                distances,
+                index,
+                0,
+            )
 
 
 def trace_impl(
@@ -278,71 +348,71 @@ def trace_impl(
     var width = m + 1
 
     for i in range(n + 1):
-        matrix.store(i * width, Int32(i))
+        matrix.unsafe_store(i * width, Int32(i))
     comptime W = simd_width_of[DType.float64]()
     var boundary_j = 1
     while boundary_j + W <= m + 1:
-        matrix.store(
+        matrix.unsafe_store(
             boundary_j,
             iota[DType.int32, W](Int32(boundary_j)),
         )
         boundary_j += W
     while boundary_j < m + 1:
-        matrix.store(boundary_j, Int32(boundary_j))
+        matrix.unsafe_store(boundary_j, Int32(boundary_j))
         boundary_j += 1
 
     for i in range(1, n + 1):
-        var ref_token = reference.load(prefix + i - 1)
+        var ref_token = reference.unsafe_load(prefix + i - 1)
         for j in range(1, m + 1):
-            var diagonal = matrix.load((i - 1) * width + j - 1)
-            var deletion = matrix.load((i - 1) * width + j) + 1
-            var insertion = matrix.load(i * width + j - 1) + 1
+            var diagonal = matrix.unsafe_load((i - 1) * width + j - 1)
+            var deletion = matrix.unsafe_load((i - 1) * width + j) + 1
+            var insertion = matrix.unsafe_load(i * width + j - 1) + 1
             var substitution = diagonal
-            if ref_token != hypothesis.load(prefix + j - 1):
+            if ref_token != hypothesis.unsafe_load(prefix + j - 1):
                 substitution += 1
-            matrix.store(i * width + j, min(substitution, min(deletion, insertion)))
+            matrix.unsafe_store(i * width + j, min(substitution, min(deletion, insertion)))
 
     var i = n
     var j = m
     var count = suffix
     for k in range(suffix):
-        operations.store(k, UInt8(0))
+        operations.unsafe_store(k, UInt8(0))
 
     while i > 0 and j > 0:
-        var current = matrix.load(i * width + j)
-        if current == matrix.load((i - 1) * width + j) + 1:
-            operations.store(count, UInt8(2))
+        var current = matrix.unsafe_load(i * width + j)
+        if current == matrix.unsafe_load((i - 1) * width + j) + 1:
+            operations.unsafe_store(count, UInt8(2))
             i -= 1
         else:
             j -= 1
             if (
                 j > 0
-                and matrix.load(i * width + j)
-                == matrix.load((i - 1) * width + j) - 1
+                and matrix.unsafe_load(i * width + j)
+                == matrix.unsafe_load((i - 1) * width + j) - 1
             ):
-                operations.store(count, UInt8(3))
+                operations.unsafe_store(count, UInt8(3))
             else:
                 i -= 1
                 if (
-                    reference.load(prefix + i)
-                    == hypothesis.load(prefix + j)
+                    reference.unsafe_load(prefix + i)
+                    == hypothesis.unsafe_load(prefix + j)
                 ):
-                    operations.store(count, UInt8(0))
+                    operations.unsafe_store(count, UInt8(0))
                 else:
-                    operations.store(count, UInt8(1))
+                    operations.unsafe_store(count, UInt8(1))
         count += 1
 
     while i > 0:
-        operations.store(count, UInt8(2))
+        operations.unsafe_store(count, UInt8(2))
         count += 1
         i -= 1
     while j > 0:
-        operations.store(count, UInt8(3))
+        operations.unsafe_store(count, UInt8(3))
         count += 1
         j -= 1
 
     for k in range(prefix):
-        operations.store(count + k, UInt8(0))
+        operations.unsafe_store(count + k, UInt8(0))
     count += prefix
 
     return count
