@@ -1,8 +1,6 @@
 """Levenshtein kernels exposed through a stable C ABI."""
 
 from std.math import iota
-from std.runtime import initialize_runtime
-from std.runtime.asyncrt import TaskGroup
 from std.sys.info import simd_width_of
 
 comptime I64Ptr = Pointer[Int64, AnyOrigin[mut=True]]
@@ -341,7 +339,7 @@ def compute_distance_at(
     )
 
 
-async def compute_distance_chunk(
+def compute_distance_chunk(
     references: I64Ptr,
     hypotheses: I64Ptr,
     reference_offsets: I64Ptr,
@@ -381,6 +379,7 @@ def mji_distances(
     hypothesis_offsets_addr: Int,
     count: Int,
     worker_count: Int,
+    chunk_index: Int,
     masks_addr: Int,
     mask_stride: Int,
     mask_word_stride: Int,
@@ -394,42 +393,20 @@ def mji_distances(
     var masks = u64_ptr(masks_addr)
     var distances = i64_ptr(distances_addr)
 
-    if worker_count > 1:
-        initialize_runtime()
-        var tasks = TaskGroup()
-        for chunk in range(worker_count):
-            tasks.create_task(
-                compute_distance_chunk(
-                    references,
-                    hypotheses,
-                    reference_offsets,
-                    hypothesis_offsets,
-                    count,
-                    worker_count,
-                    masks,
-                    mask_stride,
-                    mask_word_stride,
-                    mask_state_offset,
-                    distances,
-                    chunk,
-                )
-            )
-        tasks.wait()
-    else:
-        for index in range(count):
-            compute_distance_at(
-                references,
-                hypotheses,
-                reference_offsets,
-                hypothesis_offsets,
-                masks,
-                mask_stride,
-                mask_word_stride,
-                mask_state_offset,
-                distances,
-                index,
-                0,
-            )
+    compute_distance_chunk(
+        references,
+        hypotheses,
+        reference_offsets,
+        hypothesis_offsets,
+        count,
+        worker_count,
+        masks,
+        mask_stride,
+        mask_word_stride,
+        mask_state_offset,
+        distances,
+        chunk_index,
+    )
 
 
 def trace_impl(
@@ -560,7 +537,7 @@ def compute_trace_at(
     )
 
 
-async def compute_trace_chunk(
+def compute_trace_chunk(
     references: I64Ptr,
     hypotheses: I64Ptr,
     reference_offsets: I64Ptr,
@@ -600,6 +577,7 @@ def mji_traces(
     hypothesis_offsets_addr: Int,
     count: Int,
     worker_count: Int,
+    chunk_index: Int,
     matrices_addr: Int,
     matrix_stride: Int,
     operation_offsets_addr: Int,
@@ -615,42 +593,20 @@ def mji_traces(
     var operations = u8_ptr(operations_addr)
     var operation_counts = i64_ptr(operation_counts_addr)
 
-    if worker_count > 1:
-        initialize_runtime()
-        var tasks = TaskGroup()
-        for chunk in range(worker_count):
-            tasks.create_task(
-                compute_trace_chunk(
-                    references,
-                    hypotheses,
-                    reference_offsets,
-                    hypothesis_offsets,
-                    count,
-                    worker_count,
-                    matrices,
-                    matrix_stride,
-                    operation_offsets,
-                    operations,
-                    operation_counts,
-                    chunk,
-                )
-            )
-        tasks.wait()
-    else:
-        for index in range(count):
-            compute_trace_at(
-                references,
-                hypotheses,
-                reference_offsets,
-                hypothesis_offsets,
-                matrices,
-                matrix_stride,
-                operation_offsets,
-                operations,
-                operation_counts,
-                index,
-                0,
-            )
+    compute_trace_chunk(
+        references,
+        hypotheses,
+        reference_offsets,
+        hypothesis_offsets,
+        count,
+        worker_count,
+        matrices,
+        matrix_stride,
+        operation_offsets,
+        operations,
+        operation_counts,
+        chunk_index,
+    )
 
 
 @export("mji_trace")

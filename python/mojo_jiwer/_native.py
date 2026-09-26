@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from itertools import chain
 
 import numpy as np
@@ -18,9 +19,9 @@ I64 = ctypes.c_int64
 
 _SIGNATURES = {
     "mji_distance": ([I64] * 7, I64),
-    "mji_distances": ([I64] * 11, None),
+    "mji_distances": ([I64] * 12, None),
     "mji_trace": ([I64, I64, I64, I64, I64, I64], I64),
-    "mji_traces": ([I64] * 11, None),
+    "mji_traces": ([I64] * 12, None),
 }
 
 _library: ctypes.CDLL | None = None
@@ -206,23 +207,31 @@ def distances_flat(
     ) * mask_word_stride
     mask_stride = mask_state_offset + 2 * mask_word_stride
     token_work = int(np.maximum(ref_lengths, hyp_lengths).sum())
-    worker_count = min(16, count) if count >= 256 and token_work >= 200_000 else 1
+    worker_count = min(16, count) if count >= 256 and token_work >= 2_000_000 else 1
     scratch_count = worker_count
     masks = np.zeros(mask_stride * scratch_count, dtype=np.uint64)
     result = np.empty(count, dtype=np.int64)
-    library().mji_distances(
-        _address(ref),
-        _address(hyp),
-        _address(ref_offsets),
-        _address(hyp_offsets),
-        count,
-        worker_count,
-        _address(masks),
-        mask_stride if scratch_count > 1 else 0,
-        mask_word_stride,
-        mask_state_offset,
-        _address(result),
-    )
+    def _run_chunk(chunk: int) -> None:
+        library().mji_distances(
+            _address(ref),
+            _address(hyp),
+            _address(ref_offsets),
+            _address(hyp_offsets),
+            count,
+            worker_count,
+            chunk,
+            _address(masks),
+            mask_stride if scratch_count > 1 else 0,
+            mask_word_stride,
+            mask_state_offset,
+            _address(result),
+        )
+
+    if worker_count == 1:
+        _run_chunk(0)
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            list(executor.map(_run_chunk, range(worker_count)))
     return result.tolist()
 
 
@@ -261,7 +270,7 @@ def traces(
     max_hyp = int(hyp_lengths.max(initial=0))
     matrix_stride = (max_ref + 1) * (max_hyp + 1)
     cell_work = int(((ref_lengths + 1) * (hyp_lengths + 1)).sum())
-    worker_count = min(16, count) if count >= 256 and cell_work >= 200_000 else 1
+    worker_count = min(16, count) if count >= 256 and cell_work >= 10_000_000 else 1
     worker_count = min(
         worker_count,
         max(1, (256 * 1024 * 1024) // (matrix_stride * np.dtype(np.int32).itemsize)),
@@ -272,19 +281,27 @@ def traces(
     np.cumsum(ref_lengths + hyp_lengths, out=operation_offsets[1:])
     operations = np.empty(max(1, int(operation_offsets[-1])), dtype=np.uint8)
     operation_counts = np.empty(count, dtype=np.int64)
-    library().mji_traces(
-        _address(ref),
-        _address(hyp),
-        _address(ref_offsets),
-        _address(hyp_offsets),
-        count,
-        worker_count,
-        _address(matrices),
-        matrix_stride if worker_count > 1 else 0,
-        _address(operation_offsets),
-        _address(operations),
-        _address(operation_counts),
-    )
+    def _run_chunk(chunk: int) -> None:
+        library().mji_traces(
+            _address(ref),
+            _address(hyp),
+            _address(ref_offsets),
+            _address(hyp_offsets),
+            count,
+            worker_count,
+            chunk,
+            _address(matrices),
+            matrix_stride if worker_count > 1 else 0,
+            _address(operation_offsets),
+            _address(operations),
+            _address(operation_counts),
+        )
+
+    if worker_count == 1:
+        _run_chunk(0)
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            list(executor.map(_run_chunk, range(worker_count)))
     return [
         operations[
             int(operation_offsets[index]) : int(operation_offsets[index])
