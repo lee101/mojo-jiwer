@@ -133,6 +133,130 @@ pixi run bench
 The Pixi task uses a machine-wide file lock so concurrent benchmark jobs do not
 run together.
 
+## SIMD pass
+
+The hot contiguous loops in `src/capi.mojo` were already vectorised in earlier
+phases: the common-affix scans, the row-0/column-0 boundary, and the multiword
+mask fill and state initialisation are host-width SIMD (`comptime W =
+simd_width_of[DType.float64]()`, 16 lanes here) with scalar tails. This pass
+looked at what was left, and kept nothing: no candidate beat the previous
+binary at a caller size.
+
+Every number below was measured on 2026-11-10 on this machine (Intel Xeon
+E5-2697 v4, 72 threads). The host is shared and was busy throughout (load
+average 45-88), so the method matters more than any single number:
+
+- Candidates were built into separate `.so` files, loaded side by side in one
+  Python process, and timed by calling the public API alternately (old, new,
+  old, new), three calls per measurement, nine measurements per build. Per-run
+  ratios are reported, never a single timing.
+- Micro-candidates too short for the wall clock were measured with process CPU
+  time (`getrusage`) and the minimum over repeats.
+- Where run-to-run spread could decide it (the traceback candidates), the A/B
+  was repeated in both argument orders; for those, three runs in each order
+  agreed.
+- The shipped binary is byte-identical to the previous one
+  (sha256 `4ccbbd50...`), so the table farther up still describes it.
+
+| Candidate | Why it looked worth it | Measured old/new (faster > 1) | Verdict |
+|---|---|---:|---|
+| 16-byte boundary stores (`W = 4`) in `trace_impl` | fewer iterations for row 0 | compiled to the same bytes | reverted |
+| Same, gated on a 16-byte-aligned start | keeps the store legal for any `m` | traces 2k x 20w 1.009, 2k x 60w 1.013 | reverted, slower |
+| Carry the mask one-hot instead of `1 << (pi % 64)` | drops a modulo per mask word | 0.98-1.01 over 200-2000-word patterns | reverted, neutral |
+| Fuse the mask clear into the build pass | one pass over the hints, not two | 0.996-1.006 at real pattern widths | reverted, neutral |
+| Initialize row 0 and column 0 in one pass over the matrix | the two writes interleave in the same cache lines | traces 2k x 20w 1.012, 10k x 12w 1.040, 2k x 60w 1.018 | reverted, slower |
+| Build all chunks and counts in one Python pass | `_chunks` is 10.1 ms of a 45 ms call | 41.68 vs 41.83 ms CPU (fused/current) | reverted, neutral and would need a native path |
+| 16-lane vector mask fill, `hint[k] = k & 15` | no token-indirect loads in the fill | — | impossible, see below |
+| One-ended `str.strip()` in the CER wrapper | two Python sweeps per utterance | — | dropped, changes which whitespace is removed |
+
+Also checked and left alone: the mask clear-and-build is already one pass
+(`hint[...] = bit` for the first dimension, `|=` only for repeats), and the
+generated code has no `1 << (pi % 64)` shift to optimize away.
+
+### What the numbers say about the loops
+
+- **The boundary pass is already one 32-byte store per 8 cells.** The compiled
+  loop is `vmovdqu %ymm`; the affix scans use `vptest`, which reports "all
+  lanes equal" from one mask, so `reduce_and()` costs nothing extra. Halving
+  the store to 16 bytes does not shorten the loop in instructions, and the
+  measurements agree.
+- **A comparison benchmark on this host needs both argument orders.** The same
+  build against itself measured 0.974-1.008 in one order; the row/column
+  reordering measured 0.974-0.995 in the first order and then 0.978-1.051
+  when swapped, against a 1.008 self-control in the same order. Only running
+  both orders made the ~2.5% loss visible.
+- **The traceback is not vectorisable.** The 32-bit cost-matrix fill and the
+  traceback each depend on the cell before them, so both stay scalar. The
+  affix scans around them are SIMD and are where the width already is.
+
+### Why the mask fill cannot be widened
+
+The multiword mask is built with `hint[token * stride + pi // 64] |= 1 << pi`,
+a token-indirect scatter: the address depends on the token at each position. A
+vector form needs the addresses to be computable from the lane index alone.
+Hint word 0 carries the bits for positions 0..63, word 1 for 64..127, and so
+on, and a 16-word vector write is 1024 positions long, so for a pattern shorter
+than 1024 positions a 16-word tile writes each of its words exactly once and
+just so happens to reproduce the scalar addresses (at exactly 1024 they are
+one-to-one; longer patterns need words the tile cannot reach). That makes a
+vector fill possible only as a size-gated special case for patterns of at most
+1024 positions with distinct tokens, not as a vectorisation of the algorithm.
+The mask work is also too small to pay for that check: measured with the
+pattern length varied and the text held at one word, ~1000-8000 mask words cost
+under 0.5 us of a ~12 us call.
+
+### Where the time actually is
+
+Measured per stage, CPU time, minimum of five (ms):
+
+| Case | public | default_transform | encode | kernel |
+|---|---:|---:|---:|---:|
+| WER 10k x 12w | 107.49 | 56.41 | 20.68 | 14.18 |
+| WER 2k x 60w | 89.70 | 51.57 | 18.16 | 10.20 |
+| CER 5k x 48c | 7.57 | 7.18 (packing) | — | 2.16 |
+| process_words 2k x 20w | 46.16 | 15.58 | 6.48 | 7.00 traces + 10.10 chunks |
+
+For the WER cases roughly 72% of the call is Python glue (normalisation and
+token encoding) against 13% in the edit-distance kernel, so widening the kernel
+cannot move the end-to-end number. The kernel's per-call cost is dominated by
+fixed overhead, not by bytes: a call with no DP work at all takes ~12 us, and
+the 1000-word transcript (one Myer call whose DP takes almost the whole call)
+costs ~12.5 us. Vectorising the mask traffic would therefore not pay: it is
+under 1 us of a ~12 us call. In `process_words` the kernel is 7.0 ms;
+`_chunks` is 10.1 ms, of which the scan is 2.7 ms and building the
+`AlignmentChunk` objects and their lists is the rest. Counts and alignments
+must both be produced, and doing that in one Python pass (implemented here and
+checked value-for-value against `process_words`) measured 41.68 against
+41.83 ms CPU for the whole call: inside the noise floor, so it was not kept.
+
+### Test coverage added
+
+`tests/test_simd_tails.py` pins down the tails this kind of change puts at
+risk. Lengths 0, 1, W-1, W, W+1 and 1001 (W is 16 on this build, so the scalar
+tails of the host-width scans run), checked against upstream jiwer for hits,
+substitutions, insertions, deletions, wer, mer, wil, wip, and alignment
+chunks. It also covers the multiword hints: 65- to 1024-word patterns, a token
+repeated across the whole pattern (where a fused clear-and-build would drop
+bits: that change moved a 1000-word transcript's distance from 112, matching
+upstream, to 114), and buffer reuse across calls.
+
+### Bench lock
+
+The `pixi run bench` task locks `/tmp/mojo-bench.lock`, which every project on
+this host shares. During this pass that lock was held by a process that had
+already exited (its entry stayed in `/proc/locks`), so every waiter blocked in
+`flock(2)`. The measurements above ran serially with that lock bypassed via a
+`PATH` shim; normal `pixi run bench` should work once the lock is clear.
+
+Reproduce the table with:
+
+```bash
+pixi run bench
+```
+
+The Pixi task uses a machine-wide file lock so concurrent benchmark jobs do not
+run together.
+
 ## How it works
 
 Python applies jiwer-compatible transforms and maps arbitrary word tokens to
