@@ -286,6 +286,18 @@ SCALAR_GRID = [
 
 @pytest.mark.parametrize(("reference", "hypothesis"), SCALAR_GRID)
 @pytest.mark.parametrize("name", ["wer", "mer", "wil", "wip"])
+def test_word_measures_match_upstream_exactly(name, reference, hypothesis):
+    # No tolerance here: every rate on this grid is bit-identical to upstream.
+    # A tolerance may hide a change in the arithmetic order, so parity is
+    # asserted exactly and the tolerance below is kept only as a second net.
+    ours = getattr(mj, name)(reference, hypothesis)
+    theirs = getattr(upstream, name)(reference, hypothesis)
+    assert ours == theirs
+    assert type(ours) is type(theirs)
+
+
+@pytest.mark.parametrize(("reference", "hypothesis"), SCALAR_GRID)
+@pytest.mark.parametrize("name", ["wer", "mer", "wil", "wip"])
 def test_word_measures_within_explicit_tolerance(name, reference, hypothesis):
     ours = getattr(mj, name)(reference, hypothesis)
     theirs = getattr(upstream, name)(reference, hypothesis)
@@ -417,6 +429,7 @@ def test_process_float_fields_within_tolerance(name, reference, hypothesis):
     ours = comparable(mj.process_words(reference, hypothesis))
     theirs = comparable(upstream.process_words(reference, hypothesis))
     for field in ("wer", "mer", "wil", "wip"):
+        assert ours[field] == theirs[field], f"{name}: {field}"
         assert ours[field] == pytest.approx(theirs[field], abs=TOLERANCE)
     for field in ("references", "hypotheses", "alignments",
                   "hits", "substitutions", "insertions", "deletions"):
@@ -432,6 +445,7 @@ def test_process_float_fields_within_tolerance(name, reference, hypothesis):
 def test_character_float_fields_within_tolerance(reference, hypothesis):
     ours = comparable(mj.process_characters(reference, hypothesis))
     theirs = comparable(upstream.process_characters(reference, hypothesis))
+    assert ours["cer"] == theirs["cer"]
     assert ours["cer"] == pytest.approx(theirs["cer"], abs=TOLERANCE)
     for field in ("references", "hypotheses", "alignments",
                   "hits", "substitutions", "insertions", "deletions"):

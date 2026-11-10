@@ -403,9 +403,9 @@ upstream jiwer's RapidFuzz backend.
 
 Common-affix scans, matrix boundaries, and multiword state initialization use
 host-width SIMD with scalar remainder loops. Distance batches stay serial
-unless they contain at least 256 pairs and 200,000 input tokens. Traceback is
+unless they contain at least 256 pairs and 2,000,000 input tokens. Traceback is
 batched across one FFI call and stays serial unless it contains at least 256
-pairs and 200,000 dynamic-programming cells. Larger batches use up to 16 coarse
+pairs and 10,000,000 dynamic-programming cells. Larger batches use up to 16 coarse
 CPU workers with independent, memory-capped scratch buffers.
 
 ## GPU phase
