@@ -123,18 +123,20 @@ def _chunks(operations: list[int]) -> list[AlignmentChunk]:
     chunks: list[AlignmentChunk] = []
     ref_index = hyp_index = 0
     start = 0
-    while start < len(operations):
+    total = len(operations)
+    append = chunks.append
+    while start < total:
         operation = operations[start]
         ref_start = ref_index
         hyp_start = hyp_index
         end = start
-        while end < len(operations) and operations[end] == operation:
+        while end < total and operations[end] == operation:
             if operation != 3:
                 ref_index += 1
             if operation != 2:
                 hyp_index += 1
             end += 1
-        chunks.append(
+        append(
             AlignmentChunk(
                 names[operation], ref_start, ref_index, hyp_start, hyp_index
             )

@@ -95,19 +95,36 @@ mojo-jiwer is slower.
 
 | Case | mojo-jiwer | jiwer | jiwer / Mojo | Result |
 |---|---:|---:|---:|---|
-| WER: 10,000 x 12-word utterances | 103.09 ms | 191.55 ms | 1.86x | faster |
-| WER: 2,000 x 60-word utterances | 80.18 ms | 138.49 ms | 1.73x | faster |
-| CER: 5,000 x 48-character utterances | 6.35 ms | 155.42 ms | 24.48x | faster |
-| process_words: 2,000 x 20 words | 42.46 ms | 48.58 ms | 1.14x | faster |
-| WER: one 1,000-word transcript | 0.77 ms | 1.05 ms | 1.36x | faster |
+| WER: 10,000 x 12-word utterances | 101.87 ms | 182.15 ms | 1.79x | faster |
+| WER: 2,000 x 60-word utterances | 81.09 ms | 129.57 ms | 1.60x | faster |
+| CER: 5,000 x 48-character utterances | 6.40 ms | 148.15 ms | 23.16x | faster |
+| process_words: 2,000 x 20 words | 43.28 ms | 48.87 ms | 1.13x | faster |
+| WER: one 1,000-word transcript | 0.74 ms | 1.07 ms | 1.44x | faster |
 
-These are deliberately reported as measured. The benchmark now binds each
+These are deliberately reported as measured. The benchmark binds each
 case's inputs in its callable; an earlier table accidentally late-bound all
 five labels to the final 1,000-word input. Against the corrected pre-optimization
 baseline, Mojo improved from 134.73 to 103.09 ms, 113.69 to 80.18 ms, 99.93 to
 42.46 ms, and 2.67 to 0.77 ms in the four WER/processing cases. CER moved from
 4.75 to 6.35 ms and remains far ahead of upstream; it was not an optimization
-target. Reproduce the table with:
+target.
+
+The table above is the unroll-phase baseline, re-measured on 2026-11-10 with the
+same `bench.py`, corpora, and seeds. That pass hoisted the `len(operations)` of
+`_chunks` out of both loops. In isolation that makes `_chunks` 1.08x faster
+(10.45 to 9.65 ms for 2,000 x 20 `process_words`, best of 15 runs), but
+`process_words` end to end did not move outside noise (43.28 against 43.4 ms
+median for the same binary in an interleaved harness), so the table keeps the
+baseline figures rather than claiming a gain. Three other candidates were
+measured and reverted because they were not faster at these sizes: a 4-column
+hand-unroll of the traceback matrix loop (1.8% on the kernel, under 0.5% end to
+end), a bound-method token encoder (0.89-1.01x), and a preallocated flatten of
+the token buffers (0.43-0.59x). `@parameter for` does not compile on the pinned
+compiler, which rejects decorators on `for`. No floating-point reduction changed
+in this pass, so results and counts are bit-identical and no tolerance was
+touched.
+
+Reproduce the table with:
 
 ```bash
 pixi run bench
