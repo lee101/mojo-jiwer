@@ -1,0 +1,8 @@
+set pagination off
+attach
+set $p = $arg1
+watch *(long*)$p
+continue
+bt 6
+x/6i $pc-8
+p/x $rs

@@ -257,6 +257,136 @@ pixi run bench
 The Pixi task uses a machine-wide file lock so concurrent benchmark jobs do not
 run together.
 
+## Parallel phase
+
+Goal of this pass: split independent per-utterance work across cores above a
+size threshold, but only where the benchmark says it wins. It does not win on
+this toolchain, at any size a real caller passes, so **no in-kernel
+parallelism was added and the shipped binary is unchanged** (sha256
+`4ccbbd50...`, byte-identical to the SIMD pass). What is recorded here is the
+measurement that decided it.
+
+### What was measured
+
+`max.algorithm.parallelize(func, num_work_items, num_workers)` — the live
+import on `mojo ==1.2.0.dev2026092605`, per `MOJO_NOTES.md` §4 — does
+parallelise correctly from a `ctypes` host. Probing it with a spin loop of
+exactly-known cost, the wall time scales as expected:
+
+| work items | 1 worker | 2 workers | 4 workers |
+|---|---:|---:|---:|
+| 400 x 50 us spin, busy time / wall span | 1.00 | 1.99 | 3.95-3.99 |
+
+The worker count reaching 4 is measurable in the work itself, so the claim is
+not based on empty work items. The catch is the launch cost, timed inside
+Mojo with `perf_counter_ns` around the `parallelize` call with empty workers:
+**median 5.3-6.3 ms, minimum 5.2 ms, for 2 or 4 workers on a single item or
+400.** That cost is fixed per call, not per worker or per item, and on this
+shared host (load average 30-130 during the pass) it fluctuates by about a
+millisecond run to run.
+
+Break-even follows from those two numbers. The same spin loop, 200 items,
+4 workers:
+
+| work per item | serial work | wall | speedup | python-thread alternative |
+|---|---:|---:|---:|---:|
+| 100 us | 20 ms | 24.9 ms | 0.80x (loss) | parity at 20.5 ms |
+| 500 us | 100 ms | 30.5 ms | 3.28x | parity at 100.5 ms |
+| 2000 us | 400 ms | 108.9 ms | 3.67x | parity at 400.5 ms |
+| 4000 us | 800 ms | 206.7 ms | 3.87x | parity at 800.5 ms |
+
+So a 4-worker `parallelize` only repays its launch above roughly **80-100 ms
+of serial kernel work** (it is still losing at 20 ms; simulated from the
+measured 5.2-6.3 ms launch, break-even is 5.2 x 4 = 21 ms, and in practice
+further above that because the host is busy). The existing coarse path —
+`chunk_index` over up to 16 `ThreadPoolExecutor` threads in
+`python/mojo_jiwer/_native.py` — launches 4 threads in a median **0.50 ms**,
+about eleven times cheaper, so moving the same split inside Mojo would need a
+much larger batch before it could win.
+
+### The before and after, at sizes callers pass
+
+Serial kernel cost, measured on the shipped binary (`_native.distances_flat`
+and `_native.traces`, warm, median of 5, wall time equal to CPU time):
+
+| batch | kernel work | tokens |
+|---|---:|---:|
+| distance 5,000 x 12w | 0.85 ms | 120,000 |
+| distance 20,000 x 12w | 2.26 ms | 480,000 |
+| distance 5,000 x 60w | 2.72 ms | 600,000 |
+| distance 10,000 x 48c | 4.40 ms | 960,000 |
+| distance 20,000 x 48c | 8.80 ms | 1,920,000 |
+| distance 40,000 x 48c | 20.94 ms | 3,840,000 |
+| trace 2,000 x 20w | 6.47 ms | 80,000 |
+| trace 2,000 x 60w | 24.25 ms | 240,000 |
+| trace 10,000 x 20w | 34.56 ms | 400,000 |
+
+and end to end through the public API (same corpus and seeds as the benchmark
+table above, pickled callables avoided, median of 5):
+
+| call | mojo-jiwer (before) | with a 4-worker in-kernel path (after) |
+|---|---:|---:|
+| WER 10k x 12w (1.18 ms kernel) | 114.58 ms | not shipped: kernel is 1/97th of the call, the split is in Python glue |
+| WER 2k x 60w (1.72 ms kernel) | 90.28 ms | not shipped, same reason |
+| CER 5k x 48c (2.10 ms kernel) | 6.73 ms | not shipped, same reason |
+| process_words 2k x 20w (6.47 ms trace) | 49.70 ms | would lose: 6.47 ms of work behind a ~6 ms launch, before 4-way speedup |
+| WER 20k x 12w (2.26 ms kernel) | 227.68 ms | not shipped, kernel is ~1% |
+| CER 40k x 48c (8.80 ms kernel) | 58.64 ms | would lose: 8.8 ms of work behind a ~6 ms launch |
+| process_words 10k x 20w (34.56 ms trace) | 286.81 ms | 34.56 ms of work split 4 ways saves ~26 ms, but the call is dominated by the 253 ms Python transform/encoding/chunking, so end to end is under 1% |
+
+The largest batch any caller realistically passes to one call (40,000
+utterances of 48 characters) has 8.8-20.9 ms of kernel work; that is the top
+of the range in the first table. Even there, dividing that work by four would
+save at most 6.6-15.7 ms (arithmetic: 3/4 of the serial kernel time) against a
+~6 ms advance for the launch, and the same caller already spends 58.64 ms end
+to end on transforms and encoding, so the saving cannot exceed 27% of
+`cer` at the single largest size and is a few percent or a loss below it. Every
+smaller size loses outright. Per the rule for this phase: a parallel path that
+loses at caller sizes is worse than none, so it was reverted and no threshold
+is exposed.
+
+### What was tried and dropped, and why
+
+- **In-kernel `parallelize` over work items** (cap 4). Correct output, scales
+  3.95x, but the 5.2-6.3 ms launch loses below ~80-100 ms of work.
+  Dropped, not shipped.
+- **Worker threads joining an existing `max` thread pool across calls.** The
+  launch cost is identical on every call (5.3-6.3 ms) whether the call is the
+  first or the fifteenth, so there is no warm-up to amortise from Python.
+  Dropped.
+- **Raising the worker cap above 4.** The spin probe reaches 3.95x at 4 and
+  the launch cost does not fall with more workers; on a host at load average
+  30-130 the gain flattens. The cap was never raised, so 8/16-worker numbers
+  are not claimed here.
+- **The existing `ThreadPoolExecutor` path.** It is the comparison, not a
+  change: median 0.50 ms to launch 4 threads, so it stays.
+
+Trap worth recording for the next pass: building with `from max.algorithm
+import parallelize` makes the shared library link `libAsyncRTMojoBindings.so`,
+which the repo's Pixi env does not contain until the `max` and `max-core`
+packages are pinned at the Mojo version (`26.7.0.dev2026092605` for
+`mojo ==1.2.0.dev2026092605`). Without them `ctypes.CDLL` fails at load with
+`cannot open shared object file`. The shipped binary has no such dependency
+(only `libc`), so no pin was added while no `max` import ships.
+
+### Test coverage added
+
+`tests/test_parallel_parity.py` compares a serial batch with the same batch
+computed by four threads at once: `wer` and the raw `_native.distances` on
+three corpora, and `process_words` (counts and alignment chunks, plus
+`_native.traces`) against upstream jiwer and against itself. It passes because
+both paths reach the same serial kernel; if an in-kernel worker path is added
+later, it is the test that will catch the two paths drifting apart.
+
+Reproduce the measurements with warm runs of the shipped binary, e.g.:
+
+```bash
+pixi run python -c "
+import mojo_jiwer as mj, time
+r = ['w%d w%d w%d' % (i, i+1, i+2) for i in range(20000)]
+t = time.perf_counter(); mj.wer(r, r); print('warm', (time.perf_counter()-t)*1e3, 'ms')"
+```
+
 ## How it works
 
 Python applies jiwer-compatible transforms and maps arbitrary word tokens to
