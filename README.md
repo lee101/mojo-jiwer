@@ -408,11 +408,48 @@ batched across one FFI call and stays serial unless it contains at least 256
 pairs and 200,000 dynamic-programming cells. Larger batches use up to 16 coarse
 CPU workers with independent, memory-capped scratch buffers.
 
-There is intentionally no GPU path. Multiword Myers performs roughly 20 integer
-operations while loading or updating about 24 bytes per word, and each traceback
-cell moves at least 16 bytes for only a handful of integer operations. Both are
-well below the roughly 2 operations-per-byte threshold where device transfer
-and launch cost can pay off, so a GPU path would lose on these workloads.
+## GPU phase
+
+**CPU only: memory-bound.** No GPU path is shipped, and no GPU test or build
+step was added — so there are no GPU tests that could be skipped here. The four
+skipped tests in `pixi run test` are the pre-existing `test_simd_tails.py` cases
+(no prefix/middle/suffix split, and an empty reference that upstream rejects);
+they are unrelated to the device. None of the kernels clears the gate for this
+phase: a kernel is a GPU candidate only above roughly 2 flops per byte, and none
+here reaches 1.
+
+Every ratio below is in the analysis output, `bench/analysis_raw.json`, produced
+by `bench/_analyze.py` on 2026-11-10 on the Intel Xeon E5-2697 v4 above. The
+shared GPU was checked with `nvidia-smi --query-gpu=memory.free` and reported
+4885 MiB free, so the memory gate passed; the compute gate is what stops this
+phase.
+
+| Kernel | Work per element | Traffic per element | flops / byte | Verdict |
+|---|---|---:|---:|---|
+| 64-bit Myers (`len <= 64`, most calls) | ~4-6 integer ops on one 64-bit word | 8 B token + 24 B mask/state | ~0.13-0.25 | CPU only: memory-bound |
+| Multiword Myers (`len > 64`) | ~15 integer ops | 24 B read + 16 B store per word | ~0.38 | CPU only: memory-bound |
+| Traceback DP + backtrace | 3-4 integer ops, then a serial walk | 12 B read + 4 B store per cell | ~0.19-0.25 | CPU only: memory-bound |
+
+The analysis script's own `flops / bytes` column, which counts one Myers step per
+input token against eight bytes of token, is 0.125 for every WER and CER case
+(`wer_10k_x_12w`, `wer_2k_x_60w`, `cer_5k_x_48c`). Counting the real inner loop
+rather than the abstract step, the multiword kernel is the densest of the three
+at roughly 0.38 flops per byte. Every figure is five to fifteen times under the
+threshold, so a device path would pay full copy-in, launch, and copy-back cost
+to run arithmetic the CPU finishes in 0.3-1.7 ms of kernel time at these sizes.
+
+Sizes are the ones real callers pass, not a synthetic maximum: 10,000 x 12-word,
+2,000 x 60-word, 5,000 x 48-character, 2,000 x 20-word `process_words`, one
+1,000-word transcript, and 100 x 12-word. The distance kernel takes 0.83-1.66 ms
+on the large cases and 3.4 us on the smallest, and the multiword inner loop keeps
+its per-word op and byte counts as sequences grow, so no caller size in this
+sweep moves a kernel toward the 2 flops/byte line. There is no before/after
+timing pair to record because no GPU code was built or run; the numbers above are
+the CPU baseline it would have had to beat.
+
+This supersedes the earlier "intentionally no GPU path" paragraph, which argued
+the same conclusion from the intrinsic counts (about 20 integer operations over
+24 bytes per word) without recording the per-kernel ratios.
 
 All FFI buffers are C-contiguous NumPy allocations owned by Python. They cross
 the C ABI as integer addresses and are rebuilt as

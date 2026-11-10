@@ -169,12 +169,17 @@ def main():
             ref_off = np.empty(len(refs) + 1, dtype=np.int64)
             hyp_off = np.empty(len(hyps) + 1, dtype=np.int64)
             ref_off[0] = hyp_off[0] = 0
-            np.cumsum(np.fromiter(map(len, refs), dtype=np.int64, count=len(refs)), out=ref_off[1:])
-            np.cumsum(np.fromiter(map(len, hyps), dtype=np.int64, count=len(hyps)), out=hyp_off[1:])
+            # offsets are over characters, not utterances: sum token lengths
+            np.cumsum(
+                np.fromiter(map(len, r_tok), dtype=np.int64, count=len(r_tok)), out=ref_off[1:]
+            )
+            np.cumsum(
+                np.fromiter(map(len, h_tok), dtype=np.int64, count=len(h_tok)), out=hyp_off[1:]
+            )
             rd = np.frombuffer(r_txt.encode("utf-32le"), dtype="<u4").astype(np.int64)
             hd = np.frombuffer("".join(map(str, chain.from_iterable(h_tok))).encode("utf-32le"), dtype="<u4").astype(np.int64)
-            pairs = [(list(r), list(h)) if len(h) <= len(r) else (list(h), list(r))
-                     for r, h in zip(r_tok, h_tok)]
+            # kernel inputs are dense IDs, as in production cer
+            pairs = pairs_of(*_encode(r_tok, h_tok))
             rows["distances_flat_s"] = best(lambda: _native.distances_flat(rd, hd, ref_off, hyp_off))
             kt, n = distance_kernel_serial([(np.asarray(p[0], np.int64), np.asarray(p[1], np.int64)) for p in pairs])
             rows["dist_kernel_s"] = kt
