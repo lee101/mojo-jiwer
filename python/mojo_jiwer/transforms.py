@@ -56,6 +56,9 @@ class RemovePunctuation(AbstractTransform):
     def process_string(self, value: str):
         import unicodedata
 
+        # Matches jiwer.transformations.RemovePunctuation (BaseRemoveTransform),
+        # which calls str.replace and so raises AttributeError for None/int.
+        value.replace("", "")
         return "".join(
             character
             for character in value
@@ -94,5 +97,7 @@ class ReduceToSingleSentence(AbstractTransform):
         return value
 
     def process_list(self, values: list[str]):
-        filtered = [value for value in values if value]
+        # Matches jiwer.transformations.ReduceToSingleSentence.process_list,
+        # which filters with `len(i) >= 1` and so raises TypeError for None.
+        filtered = [value for value in values if len(value) >= 1]
         return [self.word_delimiter.join(filtered)] if filtered else []
